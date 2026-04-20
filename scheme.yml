@@ -1,0 +1,23 @@
+version: 2
+
+models:
+  - name: gcm
+    tests:
+      - reconcile_aggregates:
+          name: gcm_data_integrity_test             # <- checking_name
+          compare_relation: source('dm_data_media', 'online_publishing')
+          src_col_express:
+            - "SUM(impressions) as total_impress"
+            - "SUM(clicks) as total_clicks"
+            - "COUNT(DISTINCT placement_id) as total_placement"
+            - "COUNT(DISTINCT SPLIT(campaign,'_')[SAFE_ORDINAL(3)]) as total_cpgn"
+          comp_col_express:
+            - "SUM(impressions) as total_impress"
+            - "SUM(clicks) as total_clicks"
+            - "COUNT(DISTINCT placement_id) as total_placement"
+            - "COUNT(DISTINCT campaign_naming) as total_cpgn"
+          tolerance_pct: 0.0
+          config:
+            store_failures: true
+            schema: dbt_reconciliation
+            severity: warn
