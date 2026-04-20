@@ -1,11 +1,31 @@
 version: 2
 
+# =============================================================================
+# RECONCILIATION TESTS - Migration depuis la config legacy
+#
+# Macro utilisée : tests/generic/test_reconcile_aggregates.sql
+#
+# Modes couverts :
+#   - SCALAIRE   : pas de group_by, un seul cross join (gcm)
+#   - ROW-LEVEL  : group_by + join_keys, full outer join (radio, wealth_mgmt)
+#   - À MIGRER   : col_express vide => pattern dbt_utils.equality (synthesis, tv)
+#
+# Convention store_failures:
+#   - schema: dbt_reconciliation
+#   - severity: warn pendant la phase de stabilisation, error ensuite
+# =============================================================================
+
 models:
+
+  # ---------------------------------------------------------------------------
+  # 1. GCM  --  mode SCALAIRE (pas de group_by, comparaison de totaux)
+  # ---------------------------------------------------------------------------
   - name: gcm
+    description: "Legacy source: dw_paid_media_main_metrics.gcm"
     tests:
       - reconcile_aggregates:
-          name: gcm_data_integrity_test             # <- checking_name
-          compare_relation: source('dm_data_media', 'online_publishing')
+          name: gcm_data_integrity_test
+          compare_relation: "source('dm_data_media', 'online_publishing')"
           src_col_express:
             - "SUM(impressions) as total_impress"
             - "SUM(clicks) as total_clicks"
@@ -21,3 +41,132 @@ models:
             store_failures: true
             schema: dbt_reconciliation
             severity: warn
+
+  # ---------------------------------------------------------------------------
+  # 2. RADIO  --  mode ROW-LEVEL avec group_by et jointure sur dimensions
+  #
+  # /!\ CORRECTION LEGACY : le legacy contient deux fois
+  #     "sum(net_co) as net_co" (resp. "sum(t_net_co) as net_co").
+  #     Alias dupliqué => erreur SQL à la compilation.
+  #     Hypothèse : le second devait etre net_fo (présent dans la suite).
+  #     A valider avec le metier avant run en prod.
+  # ---------------------------------------------------------------------------
+  - name: radio
+    description: "Legacy source: dm_data_media.radio (comparée à dw_paid_media_gsheets.off_radio)"
+    tests:
+      - reconcile_aggregates:
+          name: offline_radio_data_integrity_test
+          compare_relation: "source('dw_paid_media_gsheets', 'off_radio')"
+          src_col_express:
+            - "produit"
+            - "cible"
+            - "support"
+            - "sum(net_co) as net_co"
+            - "avg(grp) as mean_grp"
+            - "sum(secodip) as secodip"
+            - "sum(base_30_s) as base_30_s"
+            - "sum(brut_applique) as brut_applique"
+            - "sum(brut_payant) as brut_payant"
+            - "sum(net_fo) as net_fo"
+            - "sum(biem) as biem"
+          comp_col_express:
+            - "produit"
+            - "cible"
+            - "support"
+            - "sum(t_net_co) as net_co"
+            - "avg(grp) as mean_grp"
+            - "sum(t_secodip) as secodip"
+            - "sum(t_base_30_s) as base_30_s"
+            - "sum(t_brut_applique) as brut_applique"
+            - "sum(t_brut_payant) as brut_payant"
+            - "sum(t_net_fo) as net_fo"
+            - "sum(t_biem) as biem"
+          src_group_by: "campagne, produit, cible, support"
+          comp_group_by: "campagne, produit, cible, support"
+          join_keys: ['produit', 'cible', 'support']
+          tolerance_pct: 0.001
+          config:
+            store_failures: true
+            schema: dbt_reconciliation
+            severity: warn
+
+  # ---------------------------------------------------------------------------
+  # 3. WEALTH MANAGEMENT  --  mode ROW-LEVEL + WHERE côté comp + CAST côté src
+  #
+  # La date est au format texte côté src ("January 15, 2025") et au format
+  # natif date côté comp. Le CAST est injecté dans src_col_express.
+  # ---------------------------------------------------------------------------
+  - name: bnp_paribas_wm_wealth_management_daily_dmd_main_metrics
+    description: "Legacy source: dw_web_analytics_adobe_analytics_datawarehouse_reports"
+    tests:
+      - reconcile_aggregates:
+          name: wealth_management_data_integrity_test
+          compare_relation: "source('dm_data_media', 'focus_site')"
+          src_col_express:
+            - "CAST(FORMAT_DATE('%Y-%m-%d', PARSE_DATE('%B %d, %Y', date)) AS DATE) as date"
+            - "SUM(visits) as total_visits"
+            - "SUM(page_views) as total_page_views"
+          comp_col_express:
+            - "date"
+            - "SUM(visits) as total_visits"
+            - "SUM(page_views) as total_page_views"
+          src_group_by: "date"
+          comp_group_by: "date"
+          join_keys: ['date']
+          comp_where: "source = 'adobe_wealth_management'"
+          tolerance_pct: 0.0
+          config:
+            store_failures: true
+            schema: dbt_reconciliation
+            severity: warn
+
+  # ---------------------------------------------------------------------------
+  # 4. SYNTHESIS  --  MIGRATION MANUELLE REQUISE
+  #
+  # Legacy: col_express vide, toute la logique est dans les .sql query_file.
+  # La macro ne s'applique pas.
+  #
+  # Pattern dbt recommandé :
+  #   a) Transformer les deux query_file en modèles dbt "check" :
+  #      - models/checks/check_dm_all_channels.sql
+  #          materialized: view, schema: checks
+  #          (corps de check_dm_all_channels.sql, avec source() au lieu du FQDN)
+  #      - models/checks/check_dm_data_media_synthesis.sql
+  #          materialized: view, schema: checks
+  #          (corps de check_dm_data_media_synthesis.sql)
+  #   b) Comparer via dbt_utils.equality (ci-dessous, à dé-commenter).
+  # ---------------------------------------------------------------------------
+  # - name: check_dm_all_channels
+  #   description: "Reconciliation online_publishing vs synthesis (ex-synthesis_data_integrity_test)"
+  #   tests:
+  #     - dbt_utils.equality:
+  #         name: synthesis_data_integrity_test
+  #         compare_model: ref('check_dm_data_media_synthesis')
+  #         config:
+  #           store_failures: true
+  #           schema: dbt_reconciliation
+  #           severity: warn
+
+  # ---------------------------------------------------------------------------
+  # 5. TV  --  MIGRATION MANUELLE REQUISE
+  #
+  # Legacy: col_express vide ET tbl vide côté src (dataset dw_paid_media_tv
+  # sans table ciblée => la logique est dans check_dw_paid_media_tv.sql,
+  # probablement une agrégation multi-tables).
+  #
+  # Etape 1 : lire check_dw_paid_media_tv.sql et identifier les tables réelles.
+  # Etape 2 : même pattern que SYNTHESIS ci-dessus
+  #   - models/checks/check_dw_paid_media_tv.sql
+  #   - models/checks/check_dm_data_tv.sql
+  #   + dbt_utils.equality
+  # ---------------------------------------------------------------------------
+  # - name: check_dw_paid_media_tv
+  #   description: "Reconciliation dw_paid_media_tv vs dm_data_media.tv (ex-tv_data_integrity_test)"
+  #   tests:
+  #     - dbt_utils.equality:
+  #         name: tv_data_integrity_test
+  #         compare_model: ref('check_dm_data_tv')
+  #         config:
+  #           store_failures: true
+  #           schema: dbt_reconciliation
+  #           severity: warn
