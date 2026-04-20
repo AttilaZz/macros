@@ -1,0 +1,713 @@
+<h1>Migration etl_paid_media_update vers dbt + Cosmos sur Airflow 3</h1>
+
+<p><em>Document de restitution — migration du pipeline paid media legacy vers une stack dbt / Cosmos / Airflow 3.</em></p>
+
+<hr/>
+
+<h2>Sommaire</h2>
+<ol>
+  <li><a href="#intro-dbt">Introduction à dbt</a></li>
+  <li><a href="#intro-cosmos">Introduction à Cosmos</a></li>
+  <li><a href="#integration-airflow">Intégration avec Airflow 3</a></li>
+  <li><a href="#migration-legacy">Migration du DAG legacy etl_paid_media_update vers full dbt</a></li>
+  <li><a href="#assets">Déclenchement du DAG dbt par Assets Airflow</a></li>
+  <li><a href="#tests-macros">Refactoring des tests de réconciliation via macros</a></li>
+  <li><a href="#logging">Logging centralisé des exécutions de tests</a></li>
+  <li><a href="#bilan">Bilan : avantages de la refacto globale</a></li>
+</ol>
+
+<hr/>
+
+<h2 id="intro-dbt">1. Introduction à dbt</h2>
+
+<h3>Définition</h3>
+<p>
+<strong>dbt</strong> (data build tool) est un framework de transformation SQL qui applique les bonnes pratiques du développement logiciel au domaine data : modularité, versionning, tests, documentation, gestion des dépendances. dbt ne déplace pas la donnée — il génère et orchestre du SQL <em>dans</em> le data warehouse cible (BigQuery, Snowflake, Databricks…).
+</p>
+
+<p>
+Dans notre cas, dbt s'appuie sur <strong>BigQuery</strong> comme moteur d'exécution. Chaque modèle dbt est matérialisé en table ou vue BQ.
+</p>
+
+<h3>Structure d'un projet dbt avec BigQuery</h3>
+
+<pre><code>dbt_project/
+├── dbt_project.yml           # Config projet (nom, paths, matérialisations par défaut)
+├── profiles.yml              # Config de connexion BigQuery
+├── packages.yml              # Dépendances (dbt_utils, audit_helper, etc.)
+├── models/                   # Les transformations SQL
+│   ├── bronze/               # Couche brute / staging
+│   ├── silver/               # Couche intermédiaire
+│   └── gold/                 # Couche métier exposée
+├── tests/
+│   ├── generic/              # Tests génériques réutilisables (reconcile_aggregates)
+│   └── reconciliation/       # Tests singuliers shadow (synthesis, tv)
+├── macros/                   # Code Jinja/SQL réutilisable
+│   ├── audit/                # log_test_results_to_monitoring
+│   ├── checks/               # query_synthesis_src, query_tv_src, etc.
+│   └── tests/                # reconcile_sql (générateur de SQL de comparaison)
+├── snapshots/                # Captures SCD type 2
+├── seeds/                    # Fichiers CSV statiques (mapping, référentiels)
+└── target/                   # Artefacts générés (manifest.json, SQL compilé)
+</code></pre>
+
+<h3>Fichier profiles.yml — exemple BigQuery</h3>
+
+<pre><code>my_project:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: service-account
+      project: mon-gcp-project-dev
+      dataset: analytics_dev
+      keyfile: /opt/airflow/gcp/sa_key.json
+      location: EU
+      threads: 4
+      timeout_seconds: 300
+    prod:
+      type: bigquery
+      method: service-account
+      project: mon-gcp-project-prod
+      dataset: analytics
+      keyfile: /opt/airflow/gcp/sa_key.json
+      location: EU
+      threads: 8
+</code></pre>
+
+<h3>Commandes dbt principales</h3>
+
+<table>
+  <thead>
+    <tr><th>Commande</th><th>Usage</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>dbt run</code></td><td>Exécute toutes les transformations (matérialise models)</td></tr>
+    <tr><td><code>dbt test</code></td><td>Exécute les tests (schema + singular + generic)</td></tr>
+    <tr><td><code>dbt build</code></td><td>Combinaison run + test dans l'ordre du DAG (recommandé en prod)</td></tr>
+    <tr><td><code>dbt compile</code></td><td>Compile le Jinja en SQL pur sans exécuter</td></tr>
+    <tr><td><code>dbt parse</code></td><td>Parse le projet et génère manifest.json</td></tr>
+    <tr><td><code>dbt deps</code></td><td>Installe les packages déclarés dans packages.yml</td></tr>
+    <tr><td><code>dbt docs generate</code> &amp; <code>dbt docs serve</code></td><td>Génère et sert la doc + lineage interactifs</td></tr>
+    <tr><td><code>dbt ls</code></td><td>Liste les ressources du projet (utilisé par Cosmos pour le parsing du DAG)</td></tr>
+    <tr><td><code>dbt --select tag:reconciliation</code></td><td>Sélection fine par tag, path, ou relations upstream/downstream</td></tr>
+  </tbody>
+</table>
+
+<h3>Avantages de dbt</h3>
+
+<ul>
+  <li><strong>Modularité</strong> — chaque transformation est un fichier SQL indépendant, réutilisable via <code>ref()</code> et <code>source()</code></li>
+  <li><strong>Lineage automatique</strong> — dbt construit le graphe de dépendances et orchestre les runs dans le bon ordre</li>
+  <li><strong>Tests first-class</strong> — tests génériques (not_null, unique, relationships) + tests custom + singular tests</li>
+  <li><strong>Idempotence</strong> — rejouer un run produit le même résultat ; pas de "magie" d'état</li>
+  <li><strong>Versionning</strong> — tout le code transformation vit dans Git, avec code reviews et CI</li>
+  <li><strong>Documentation vivante</strong> — les descriptions YAML génèrent une doc navigable avec le lineage</li>
+  <li><strong>Templating Jinja</strong> — logique conditionnelle, boucles, macros pour factoriser le SQL</li>
+  <li><strong>Performance</strong> — les transformations tournent dans le warehouse (push-down compute), pas en pull</li>
+</ul>
+
+<hr/>
+
+<h2 id="intro-cosmos">2. Introduction à Cosmos</h2>
+
+<h3>Le problème résolu</h3>
+<p>
+dbt gère parfaitement les transformations, mais n'orchestre pas l'ensemble d'un pipeline data (ingestion, dépendances inter-projets, re-runs ciblés, SLA). Côté Airflow, on peut appeler dbt via un <code>BashOperator</code>, mais on perd alors toute la granularité du DAG dbt : chaque modèle devient invisible, les retries sont "tout ou rien", impossible de cibler un seul modèle.
+</p>
+
+<h3>La solution Cosmos</h3>
+<p>
+<strong>Cosmos</strong> (package Astronomer open source) convertit un projet dbt en <strong>TaskGroup Airflow</strong>, où chaque modèle dbt devient une tâche Airflow distincte. On obtient :
+</p>
+
+<ul>
+  <li>Une task Airflow par modèle dbt (<code>run</code> + <code>test</code> couplés)</li>
+  <li>Les dépendances Airflow reflètent exactement le DAG dbt</li>
+  <li>Retry granulaire modèle par modèle</li>
+  <li>Observabilité Airflow native (logs, durées, XCom, alerting) au niveau modèle</li>
+  <li>Pas de duplication de config : un seul <code>dbt_project.yml</code> pilote les deux mondes</li>
+</ul>
+
+<h3>Modes de chargement (LoadMode)</h3>
+
+<table>
+  <thead>
+    <tr><th>Mode</th><th>Principe</th><th>Contexte recommandé</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>LoadMode.DBT_LS</code></td>
+      <td>Exécute <code>dbt ls</code> au parsing du DAG</td>
+      <td>Dev local, petits projets</td>
+    </tr>
+    <tr>
+      <td><code>LoadMode.DBT_MANIFEST</code></td>
+      <td>Lit un <code>manifest.json</code> pré-généré</td>
+      <td><strong>Prod</strong> — rapide, pas besoin de dbt au scheduler</td>
+    </tr>
+    <tr>
+      <td><code>LoadMode.AUTOMATIC</code></td>
+      <td>Essaie MANIFEST puis DBT_LS</td>
+      <td>Mise en route initiale</td>
+    </tr>
+    <tr>
+      <td><code>LoadMode.CUSTOM</code></td>
+      <td>Parser Jinja interne, ignore dbt</td>
+      <td>Projets très simples uniquement</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+<strong>En prod, nous utilisons <code>DBT_MANIFEST</code></strong> avec un <code>manifest.json</code> généré en CI/CD et déployé avec les DAGs. Cela évite de faire tourner <code>dbt ls</code> depuis le scheduler Airflow, ce qui aurait impliqué d'y installer dbt et d'y exposer les credentials BigQuery — principe du moindre privilège.
+</p>
+
+<hr/>
+
+<h2 id="integration-airflow">3. Intégration avec Airflow 3</h2>
+
+<h3>Configuration du profil via Airflow Connection</h3>
+
+<p>
+Plutôt que de monter un fichier <code>keyfile</code> dans les workers, nous utilisons une <strong>Airflow Connection</strong> alimentée par Google Cloud Secret Manager, et Cosmos génère le profil dbt à la volée :
+</p>
+
+<pre><code>from cosmos import DbtDag, ProjectConfig, ProfileConfig, RenderConfig, ExecutionConfig
+from cosmos.profiles import GoogleCloudServiceAccountDictProfileMapping
+from cosmos.constants import LoadMode, TestBehavior
+from pathlib import Path
+from datetime import datetime
+
+DBT_PROJECT_PATH = Path("/opt/airflow/dbt/paid_media")
+MANIFEST_PATH = DBT_PROJECT_PATH / "target" / "manifest.json"
+
+profile_config = ProfileConfig(
+    profile_name="paid_media",
+    target_name="prod",
+    profile_mapping=GoogleCloudServiceAccountDictProfileMapping(
+        conn_id="google_cloud_default",
+        profile_args={
+            "project": "mon-gcp-project-prod",
+            "dataset": "analytics",
+            "location": "EU",
+            "threads": 8,
+        },
+    ),
+)
+
+dbt_paid_media_dag = DbtDag(
+    dag_id="dbt_paid_media",
+    project_config=ProjectConfig(
+        dbt_project_path=DBT_PROJECT_PATH,
+        manifest_path=MANIFEST_PATH,
+    ),
+    profile_config=profile_config,
+    render_config=RenderConfig(
+        load_method=LoadMode.DBT_MANIFEST,
+        test_behavior=TestBehavior.AFTER_EACH,
+    ),
+    execution_config=ExecutionConfig(
+        dbt_executable_path="/opt/airflow/dbt_venv/bin/dbt",
+    ),
+    schedule=[raw_paid_media_asset],     # déclenché par asset (voir section 5)
+    start_date=datetime(2026, 1, 1),
+    catchup=False,
+    tags=["dbt", "paid_media"],
+)
+</code></pre>
+
+<h3>Breaking changes Airflow 3 à noter</h3>
+
+<ul>
+  <li><code>airflow.datasets.Dataset</code> devient <code>airflow.sdk.Asset</code> (l'ancien alias reste disponible)</li>
+  <li>Les décorateurs <code>@dag</code> et <code>@task</code> sont importés depuis <code>airflow.sdk</code></li>
+  <li>Les <code>outlets</code> sur les tâches émettent des "asset events" consommables par d'autres DAGs</li>
+  <li>La nouvelle UI expose une vue <strong>Assets</strong> dédiée pour visualiser producteurs / consommateurs</li>
+</ul>
+
+<hr/>
+
+<h2 id="migration-legacy">4. Migration du DAG etl_paid_media_update vers full dbt</h2>
+
+<h3>L'existant legacy</h3>
+
+<p>
+Le DAG <code>etl_paid_media_update</code> orchestrait un pipeline monolithique où chaque étape était un script Python ou SQL embarqué dans un <code>PythonOperator</code> / <code>BigQueryInsertJobOperator</code>. Caractéristiques :
+</p>
+
+<ul>
+  <li>Transformations SQL dispersées dans des fichiers <code>.sql</code> isolés, avec templating manuel <code>{project_id}.{dataset}.{table}</code></li>
+  <li>Aucun lineage, aucune doc auto-générée</li>
+  <li>Tests de réconciliation implémentés en Python, pilotés par des fichiers JSON de configuration</li>
+  <li>Re-run granulaire impossible : en cas d'échec, rejoue complet ou rien</li>
+  <li>Dépendances inter-DAGs gérées par <code>ExternalTaskSensor</code> avec alignement temporel fragile</li>
+</ul>
+
+<h3>Domaines couverts par le pipeline</h3>
+
+<table>
+  <thead>
+    <tr><th>Domaine</th><th>Dataset source</th><th>Cible</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>GCM (Google Campaign Manager)</td><td><code>dw_paid_media_main_metrics.gcm</code></td><td><code>dm_data_media.online_publishing</code></td></tr>
+    <tr><td>Radio (offline)</td><td><code>dw_paid_media_gsheets.off_radio</code></td><td><code>dm_data_media.radio</code></td></tr>
+    <tr><td>TV</td><td><code>dw_paid_media_tv.*</code> (multi-tables)</td><td><code>dm_data_media.tv</code></td></tr>
+    <tr><td>Synthesis multi-canaux</td><td>agrégation de 8 sources</td><td><code>dm_data_media.synthesis</code></td></tr>
+    <tr><td>Wealth Management web</td><td><code>dw_web_analytics_adobe_*</code></td><td><code>dm_data_media.focus_site</code></td></tr>
+  </tbody>
+</table>
+
+<h3>Cible full dbt</h3>
+
+<p>
+Chaque transformation SQL devient un <strong>modèle dbt</strong> dans une architecture medallion :
+</p>
+
+<ul>
+  <li><strong>Bronze</strong> : ingestion brute, typage, dé-duplication basique (matérialisation <code>table</code>, partitionnée)</li>
+  <li><strong>Silver</strong> : nettoyage, normalisation, jointures référentielles (matérialisation <code>view</code> ou <code>incremental</code>)</li>
+  <li><strong>Gold</strong> : agrégats métier exposés aux consommateurs BI (matérialisation <code>view</code> le plus souvent)</li>
+</ul>
+
+<h3>Gains immédiats de la migration</h3>
+
+<ul>
+  <li><strong>Lineage complet</strong> visible dans <code>dbt docs</code> et dans l'UI Airflow via Cosmos</li>
+  <li><strong>Re-run ciblé</strong> : <code>dbt run --select gold.prix_realise_elec_fr_retail+</code> rejoue un modèle et toute sa descendance</li>
+  <li><strong>Tests unitaires au niveau modèle</strong> couplés au run</li>
+  <li><strong>Portabilité dev/prod</strong> via le système de <code>target</code> et de <code>vars</code> dans profiles.yml</li>
+  <li><strong>Pas de secrets en clair</strong> : credentials via Secret Manager + Airflow Connection</li>
+</ul>
+
+<hr/>
+
+<h2 id="assets">5. Déclenchement du DAG dbt par Assets Airflow</h2>
+
+<h3>Principe</h3>
+
+<p>
+Au lieu d'un scheduling par cron fragile ou d'un <code>ExternalTaskSensor</code> coûteux en ressources, nous utilisons les <strong>Assets</strong> d'Airflow 3 pour déclencher automatiquement le DAG dbt dès que ses données amont sont prêtes.
+</p>
+
+<h3>DAG producteur (ingestion)</h3>
+
+<pre><code>from airflow.sdk import dag, task, Asset
+from datetime import datetime
+
+# URI canonique BigQuery = identifiant unique de l'asset
+raw_paid_media_asset = Asset(
+    name="raw_paid_media",
+    uri="bigquery://mon-gcp-project-raw/dw_paid_media_main_metrics/gcm",
+)
+
+@dag(
+    dag_id="ingestion_paid_media",
+    start_date=datetime(2026, 1, 1),
+    schedule="0 6 * * *",
+    catchup=False,
+)
+def ingestion_dag():
+
+    @task(outlets=[raw_paid_media_asset])   # <-- PRODUIT l'asset
+    def load_bronze():
+        # logique d'ingestion API / GCS -> BigQuery
+        ...
+
+    load_bronze()
+
+ingestion_dag()
+</code></pre>
+
+<h3>DAG consommateur (dbt)</h3>
+
+<pre><code># Même asset (URI identique)
+raw_paid_media_asset = Asset(
+    name="raw_paid_media",
+    uri="bigquery://mon-gcp-project-raw/dw_paid_media_main_metrics/gcm",
+)
+
+dbt_paid_media_dag = DbtDag(
+    dag_id="dbt_paid_media",
+    ...
+    schedule=[raw_paid_media_asset],    # <-- CONSOMME l'asset
+    ...
+)
+</code></pre>
+
+<h3>Avantages</h3>
+
+<ul>
+  <li><strong>Zéro sensor</strong> : plus de tâche qui "attend" une autre DAG, plus d'alignement temporel</li>
+  <li><strong>Découplage</strong> : le DAG d'ingestion ne connaît pas ses consommateurs</li>
+  <li><strong>Vue Assets</strong> dans l'UI Airflow : graphe producteurs/consommateurs navigable</li>
+  <li><strong>Déclenchement réactif</strong> : dès que l'asset est produit, le DAG dbt démarre</li>
+  <li><strong>Combinaisons</strong> : <code>AssetAny</code> / <code>AssetAll</code> permettent des conditions fines (déclencher si A ET B, ou si A OU B)</li>
+</ul>
+
+<p>
+<strong>Convention adoptée</strong> : les <code>Asset</code> sont centralisés dans <code>dags/assets.py</code> pour éviter toute divergence d'URI entre producteur et consommateur, qui casserait silencieusement la chaîne.
+</p>
+
+<hr/>
+
+<h2 id="tests-macros">6. Refactoring des tests de réconciliation via macros</h2>
+
+<h3>Le legacy</h3>
+
+<p>
+Le système legacy s'appuyait sur des fichiers JSON de configuration associés à des templates SQL :
+</p>
+
+<pre><code>{
+  "checking_name": "gcm_data_integrity_test",
+  "src": {
+    "dataset": "dw_paid_media_main_metrics",
+    "tbl": "gcm",
+    "col_express": [
+      "SUM(impressions) as total_impress",
+      "SUM(clicks) as total_clicks",
+      "COUNT(DISTINCT placement_id) as total_placement"
+    ]
+  },
+  "comp": {
+    "dataset": "dm_data_media",
+    "tbl": "online_publishing",
+    "col_express": [
+      "SUM(impressions) as total_impress",
+      "SUM(clicks) as total_clicks",
+      "COUNT(DISTINCT placement_id) as total_placement"
+    ]
+  }
+}
+</code></pre>
+
+<p>
+Un moteur Python générait deux DataFrames à partir des templates SQL et comparait l'égalité. L'approche marchait, mais souffrait de limites :
+</p>
+
+<ul>
+  <li>Logique de test dupliquée en dehors du code des transformations</li>
+  <li>Pas d'intégration avec le lineage ni avec les runs</li>
+  <li>Fichiers de config à maintenir manuellement, sans validation</li>
+  <li>Alerting implémenté ad-hoc en Python</li>
+</ul>
+
+<h3>La cible — deux patterns dbt</h3>
+
+<p>
+Après analyse, les 5 tests legacy se répartissent en deux familles nécessitant deux approches :
+</p>
+
+<table>
+  <thead>
+    <tr><th>Famille</th><th>Tests concernés</th><th>Macro utilisée</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Template-driven</strong><br/>(SELECT paramétré)</td>
+      <td>gcm, radio, wealth_management</td>
+      <td><code>reconcile_aggregates</code> (generic test)</td>
+    </tr>
+    <tr>
+      <td><strong>SQL-file-driven</strong><br/>(logique figée complexe)</td>
+      <td>synthesis, tv</td>
+      <td><code>reconcile_sql</code> (singular test)</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Architecture shadow</h3>
+
+<p>
+Contrainte forte : <strong>aucun artefact intermédiaire en warehouse</strong>. Les tests ne doivent pas créer de modèles "check" à maintenir. Solution : encapsuler le SQL legacy dans des <strong>macros Jinja</strong>, et les composer via des singular tests.
+</p>
+
+<pre><code>dbt_project/
+├── macros/
+│   ├── checks/                      # SQL legacy encapsulé (aucune matérialisation)
+│   │   ├── query_synthesis_src.sql  # ex-check_dm_all_channels.sql
+│   │   ├── query_synthesis_comp.sql
+│   │   ├── query_tv_src.sql         # ex-check_dw_paid_media_tv.sql
+│   │   └── query_tv_comp.sql
+│   └── tests/
+│       └── reconcile_sql.sql        # Générateur de SQL de comparaison
+├── tests/
+│   ├── generic/
+│   │   └── reconcile_aggregates.sql # Test générique paramétré
+│   └── reconciliation/              # Singular tests shadow
+│       ├── synthesis_data_integrity_test.sql
+│       └── tv_data_integrity_test.sql
+└── models/
+    └── _sources.yml                 # Tests attachés aux sources
+</code></pre>
+
+<h3>Macro reconcile_aggregates (test générique)</h3>
+
+<p>
+Utilisée pour les tests "template-driven" — la macro reçoit directement les <code>col_express</code>, <code>group_by</code>, <code>where</code> depuis le YAML et génère la comparaison. Gère deux modes :
+</p>
+
+<ul>
+  <li><strong>Mode scalaire</strong> (<code>join_keys=[]</code>) : un <code>CROSS JOIN</code> simple entre deux lignes d'agrégats totaux</li>
+  <li><strong>Mode row-level</strong> (<code>join_keys=[...]</code>) : un <code>FULL OUTER JOIN</code> sur les dimensions, avec détection des lignes manquantes d'un côté comme de l'autre</li>
+</ul>
+
+<p>Exemple d'utilisation dans <code>_sources.yml</code> :</p>
+
+<pre><code>sources:
+  - name: dw_paid_media_main_metrics
+    database: "{{ var('raw_project') }}"
+    schema: dw_paid_media_main_metrics
+    tables:
+      - name: gcm
+        tests:
+          - reconcile_aggregates:
+              name: gcm_data_integrity_test
+              compare_relation: "source('dm_data_media', 'online_publishing')"
+              src_col_express:
+                - "SUM(impressions) as total_impress"
+                - "SUM(clicks) as total_clicks"
+                - "COUNT(DISTINCT placement_id) as total_placement"
+                - "COUNT(DISTINCT SPLIT(campaign,'_')[SAFE_ORDINAL(3)]) as total_cpgn"
+              comp_col_express:
+                - "SUM(impressions) as total_impress"
+                - "SUM(clicks) as total_clicks"
+                - "COUNT(DISTINCT placement_id) as total_placement"
+                - "COUNT(DISTINCT campaign_naming) as total_cpgn"
+              tolerance_pct: 0.0
+              config:
+                store_failures: true
+                schema: dbt_reconciliation
+                severity: warn
+                tags: ['reconciliation']
+</code></pre>
+
+<h3>Macro reconcile_sql (générateur pour singular tests)</h3>
+
+<p>
+Utilisée pour les tests "SQL-file-driven" où la logique est trop complexe pour tenir dans un YAML. Le SQL legacy est encapsulé dans une macro <code>query_*.sql</code> et la comparaison est tissée au moment du test.
+</p>
+
+<pre><code>-- tests/reconciliation/synthesis_data_integrity_test.sql
+{{ config(
+    tags=['reconciliation', 'synthesis'],
+    severity='warn',
+    store_failures=true,
+    schema='dbt_reconciliation'
+) }}
+
+{{ reconcile_sql(
+    src_sql         = query_synthesis_src(),
+    comp_sql        = query_synthesis_comp(),
+    compare_columns = [
+        'impressions', 'clicks', 'cost', 'vv100',
+        'insertion_contact_grp_cinema', 'circulation_or_spot', 'tech_fees'
+    ],
+    tolerance_pct   = 0.0
+) }}
+</code></pre>
+
+<p>
+Au runtime, dbt compile ce test en une <strong>unique requête</strong> qui inline les deux SQL comme CTEs et calcule les écarts. Aucune vue n'est créée, rien n'est persisté — sauf si le test échoue, auquel cas <code>store_failures: true</code> stocke les lignes divergentes dans <code>dbt_reconciliation.&lt;test_name&gt;</code> pour analyse.
+</p>
+
+<h3>Gestion des divergences de structure</h3>
+
+<p>
+Point clé : les tables legacy et cible ont des <strong>structures différentes</strong> (colonnes renommées, casts de dates, filtres métier). La macro prend cela en charge via :
+</p>
+
+<ul>
+  <li><code>src_col_express</code> / <code>comp_col_express</code> : expressions SQL distinctes des deux côtés</li>
+  <li><code>src_where</code> / <code>comp_where</code> : filtres WHERE indépendants</li>
+  <li><code>src_group_by</code> / <code>comp_group_by</code> : group by indépendants</li>
+  <li>Alias de colonnes identiques à la sortie, garantissant la correspondance pour la comparaison</li>
+</ul>
+
+<p>Exemple concret — test wealth management, qui casse un format de date en chaîne côté legacy :</p>
+
+<pre><code>- reconcile_aggregates:
+    name: wealth_management_data_integrity_test
+    compare_relation: "source('dm_data_media', 'focus_site')"
+    src_col_express:
+      - "CAST(FORMAT_DATE('%Y-%m-%d', PARSE_DATE('%B %d, %Y', date)) AS DATE) as date"
+      - "SUM(visits) as total_visits"
+      - "SUM(page_views) as total_page_views"
+    comp_col_express:
+      - "date"
+      - "SUM(visits) as total_visits"
+      - "SUM(page_views) as total_page_views"
+    src_group_by: "date"
+    comp_group_by: "date"
+    join_keys: ['date']
+    comp_where: "source = 'adobe_wealth_management'"
+    tolerance_pct: 0.0
+</code></pre>
+
+<hr/>
+
+<h2 id="logging">7. Logging centralisé des exécutions de tests</h2>
+
+<h3>Objectif</h3>
+
+<p>
+Au-delà du comportement immédiat (échec = DAG Airflow en erreur), nous avons besoin d'un <strong>journal historique</strong> de toutes les exécutions de tests pour :
+</p>
+
+<ul>
+  <li>Monitoring long terme de la qualité (dashboard Looker)</li>
+  <li>Calcul de SLA / SLO sur les tests critiques</li>
+  <li>Détection des tests instables (flapping)</li>
+  <li>Audit réglementaire</li>
+</ul>
+
+<h3>Mécanisme : on-run-end hook</h3>
+
+<p>
+Une macro <code>log_test_results_to_monitoring</code> est invoquée automatiquement à la fin de chaque <code>dbt test</code> / <code>dbt build</code> via un hook <code>on-run-end</code> dans <code>dbt_project.yml</code> :
+</p>
+
+<pre><code>on-run-end:
+  - "{{ log_test_results_to_monitoring() }}"
+</code></pre>
+
+<p>
+La macro exploite les variables globales exposées par dbt dans le scope du hook : <code>results</code> (statuts de chaque nœud exécuté), <code>invocation_id</code> (UUID du run), <code>run_started_at</code> (horodatage).
+</p>
+
+<h3>Table de journal BigQuery</h3>
+
+<pre><code>CREATE TABLE IF NOT EXISTS `mon-projet.dbt_audit.dbt_test_results` (
+    test_execution_id         STRING,
+    test_execution_timestamp  TIMESTAMP,
+    test_name                 STRING,
+    test_type                 STRING,      -- not_null / unique / reconcile_aggregates / custom
+    attached_node             STRING,      -- model ou source testé
+    attached_node_type        STRING,      -- 'model' ou 'source'
+    column_name               STRING,
+    test_status               STRING,      -- pass / fail / warn / error
+    failures                  INT64,
+    execution_time_s          FLOAT64,
+    severity                  STRING,
+    target_name               STRING,
+    message                   STRING,
+    tags                      ARRAY&lt;STRING&gt;
+)
+PARTITION BY DATE(test_execution_timestamp)
+CLUSTER BY test_status, test_name
+</code></pre>
+
+<h3>Exemples de requêtes d'exploitation</h3>
+
+<p>Tests en échec sur les 7 derniers jours :</p>
+
+<pre><code>SELECT test_execution_timestamp, test_name, failures, message
+FROM `mon-projet.dbt_audit.dbt_test_results`
+WHERE test_status IN ('fail', 'error', 'warn')
+  AND test_execution_timestamp &gt;= CURRENT_TIMESTAMP() - INTERVAL 7 DAY
+ORDER BY test_execution_timestamp DESC;
+</code></pre>
+
+<p>Taux d'échec par test sur 30 jours (détection des tests instables) :</p>
+
+<pre><code>SELECT
+    test_name,
+    COUNT(*) AS nb_runs,
+    COUNTIF(test_status IN ('fail', 'error')) AS nb_failures,
+    ROUND(100 * SAFE_DIVIDE(COUNTIF(test_status IN ('fail', 'error')), COUNT(*)), 1) AS fail_rate_pct
+FROM `mon-projet.dbt_audit.dbt_test_results`
+WHERE test_execution_timestamp &gt;= CURRENT_TIMESTAMP() - INTERVAL 30 DAY
+GROUP BY test_name
+HAVING fail_rate_pct &gt; 0
+ORDER BY fail_rate_pct DESC;
+</code></pre>
+
+<hr/>
+
+<h2 id="bilan">8. Bilan : avantages de la refacto globale</h2>
+
+<h3>Comparatif avant / après</h3>
+
+<table>
+  <thead>
+    <tr><th>Dimension</th><th>Legacy (etl_paid_media_update)</th><th>Cible (dbt + Cosmos + Airflow 3)</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Orchestration</td>
+      <td>DAG monolithique, scripts Python wrappant du SQL</td>
+      <td>DAG Airflow reflétant le DAG dbt, 1 task par modèle</td>
+    </tr>
+    <tr>
+      <td>Granularité retry</td>
+      <td>Rejouer tout ou rien</td>
+      <td>Retry par modèle, re-run ciblé via <code>--select</code></td>
+    </tr>
+    <tr>
+      <td>Lineage</td>
+      <td>Inexistant, documenté sur Confluence manuellement</td>
+      <td>Auto-généré, navigable (dbt docs + UI Airflow)</td>
+    </tr>
+    <tr>
+      <td>Tests</td>
+      <td>Fichiers JSON + moteur Python maison</td>
+      <td>Tests dbt first-class, macros paramétrées, <code>store_failures</code></td>
+    </tr>
+    <tr>
+      <td>Réconciliation</td>
+      <td>Comparaison DataFrame, pas d'historique</td>
+      <td>Tests shadow, journal BQ, dashboard Looker</td>
+    </tr>
+    <tr>
+      <td>Dépendances inter-DAG</td>
+      <td><code>ExternalTaskSensor</code> + alignement cron</td>
+      <td>Airflow Assets, déclenchement événementiel</td>
+    </tr>
+    <tr>
+      <td>Credentials</td>
+      <td>Keyfile monté en dur dans les workers</td>
+      <td>Secret Manager + Airflow Connection</td>
+    </tr>
+    <tr>
+      <td>Code review</td>
+      <td>Scripts éparpillés, revues difficiles</td>
+      <td>Modèles SQL versionnés, schéma en YAML, CI dbt</td>
+    </tr>
+    <tr>
+      <td>Documentation</td>
+      <td>Désynchronisée du code</td>
+      <td>Inline dans YAML, générée par <code>dbt docs</code></td>
+    </tr>
+    <tr>
+      <td>Parsing DAG Airflow</td>
+      <td>N/A</td>
+      <td><code>manifest.json</code> pré-compilé, zéro dbt au scheduler</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Bénéfices qualitatifs</h3>
+
+<ul>
+  <li><strong>Maintenabilité</strong> — un SQL dbt est plus lisible qu'un <code>PythonOperator</code> qui exécute une f-string SQL ; les modifications font l'objet de PRs claires</li>
+  <li><strong>Onboarding</strong> — un data engineer connaissant dbt peut contribuer sans apprendre le code maison ; les conventions sont standardisées</li>
+  <li><strong>Fiabilité</strong> — l'idempotence native de dbt + les retries granulaires de Cosmos réduisent les interventions manuelles</li>
+  <li><strong>Observabilité</strong> — qualité des données journalisée, exposable sur dashboard</li>
+  <li><strong>Découplage</strong> — les DAGs ne sont plus couplés par timing mais par événements (Assets)</li>
+  <li><strong>Testabilité</strong> — les tests de réconciliation sont capitalisés et réutilisables via macros, au lieu d'être dupliqués en config JSON</li>
+</ul>
+
+<h3>Points d'attention pour la suite</h3>
+
+<ul>
+  <li><strong>Stabilisation des tolérances</strong> : les tests sont pour l'instant en <code>severity: warn</code> pendant la phase de migration. Ils passeront en <code>severity: error</code> une fois les écarts résiduels résorbés (notamment la partie FOURNITURE identifiée sur l'électricité retail).</li>
+  <li><strong>Génération du manifest en CI</strong> : la génération du <code>manifest.json</code> à chaque PR mergée doit être fiabilisée ; un manifest obsolète provoque des DAGs Airflow incohérents avec le code dbt.</li>
+  <li><strong>Alerting Slack</strong> : branchement prévu sur la table <code>dbt_audit.dbt_test_results</code> pour notifier l'équipe data lorsqu'un test critique échoue deux fois de suite.</li>
+  <li><strong>Extension à d'autres pipelines</strong> : l'architecture (Cosmos + Assets + macros de réconciliation) est transposable aux autres domaines legacy, qui feront l'objet de migrations successives.</li>
+</ul>
+
+<hr/>
+
+<p><em>Fin du document.</em></p>
