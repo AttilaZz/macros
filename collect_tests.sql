@@ -1,189 +1,95 @@
-{#-
-    =========================================================================
-    log_test_results
-    =========================================================================
+{% macro log_test_results_to_monitoring(results) %}
+  {% if execute %}
 
-    Macro à appeler depuis un on-run-end hook. À la fin de dbt test / dbt build,
-    parcourt l'objet `results` (injecté par dbt), filtre les tests, et
-    INSÈRE une ligne par test dans une table d'audit BigQuery.
+    {% set create_table_query %}
+      CREATE TABLE IF NOT EXISTS {{ target.catalog }}.{{ target.schema }}.dbt_test_results (
+        test_execution_id STRING,
+        test_execution_timestamp TIMESTAMP,
+        test_name STRING,
+        test_type STRING,
+        model_name STRING,
+        column_name STRING,
+        test_status STRING,
+        failures BIGINT,
+        severity STRING,
+        target_name STRING
+      )
+    {% endset %}
+    {% do run_query(create_table_query) %}
 
-    Usage dans dbt_project.yml :
-        on-run-end:
-          - "{{ log_test_results() }}"
+    {% set test_results = results | selectattr('node.resource_type', 'equalto', 'test') | list %}
 
-    Paramètres
-    ----------
-    target_database : projet BQ cible (défaut: target.database)
-    target_schema   : dataset BQ cible (défaut: 'dbt_audit')
-    target_table    : nom de table (défaut: 'test_results')
-    create_if_not_exists : crée la table au premier run si elle n'existe pas
--#}
+    {% for test_result in test_results %}
+      {% set test_node = test_result.node %}
+      {% set test_name = test_node.name %}
 
-{% macro log_test_results(
-    target_database=none,
-    target_schema='dbt_audit',
-    target_table='test_results',
-    create_if_not_exists=true
-) %}
+      {# Extraction du model_name depuis refs (RefArgs object) #}
+      {% set model_name = 'unknown' %}
+      {% if test_node.refs and test_node.refs | length > 0 %}
+        {% set model_name = test_node.refs[0].name %}
+      {% endif %}
 
-    {#- Skip pendant le parse / compile / quand il n'y a pas de résultats -#}
-    {% if not execute %}
-        {% do return('') %}
-    {% endif %}
+      {# Fallback: extraire depuis depends_on.nodes #}
+      {% if model_name == 'unknown' and test_node.depends_on and test_node.depends_on.nodes %}
+        {% for dep in test_node.depends_on.nodes %}
+          {% if 'model.' in dep %}
+            {% set model_name = dep.split('.')[-1] %}
+            {% break %}
+          {% endif %}
+        {% endfor %}
+      {% endif %}
 
-    {% if results is not defined or results | length == 0 %}
-        {% do log("log_test_results: aucun résultat à logger, skip.", info=true) %}
-        {% do return('') %}
-    {% endif %}
+      {% set column_name = test_node.column_name if test_node.column_name else 'N/A' %}
+      {% set test_status = test_result.status %}
+      {% set failures = test_result.failures if test_result.failures is not none else 0 %}
+      {% set severity = test_node.config.severity if test_node.config.severity else 'warn' %}
 
-    {#- Résolution de la destination -#}
-    {% set db = target_database or target.database %}
-    {% set fq_table = adapter.quote(db) ~ '.' ~ adapter.quote(target_schema) ~ '.' ~ adapter.quote(target_table) %}
+      {% set test_type = 'custom' %}
+      {% if 'not_null' in test_name %}
+        {% set test_type = 'not_null' %}
+      {% elif 'unique' in test_name %}
+        {% set test_type = 'unique' %}
+      {% elif 'accepted_values' in test_name %}
+        {% set test_type = 'accepted_values' %}
+      {% elif 'relationships' in test_name %}
+        {% set test_type = 'relationships' %}
+      {% elif 'not_empty_string' in test_name %}
+        {% set test_type = 'not_empty_string' %}
+      {% elif 'expect_column_value_lengths' in test_name %}
+        {% set test_type = 'value_length' %}
+      {% endif %}
 
-    {#- Création de la table si besoin -#}
-    {% if create_if_not_exists %}
-        {% set create_sql %}
-            create schema if not exists {{ adapter.quote(db) }}.{{ adapter.quote(target_schema) }}
-            options(location = '{{ target.location or "EU" }}');
+      {% if test_type != 'custom' %}
 
-            create table if not exists {{ fq_table }} (
-                invocation_id     string    not null,
-                run_started_at    timestamp not null,
-                executed_at       timestamp not null,
-                project_name      string,
-                target_name       string,
-                test_name         string    not null,
-                test_unique_id    string,
-                resource_type     string,
-                status            string    not null,
-                failures          int64,
-                execution_time_s  float64,
-                message           string,
-                tags              array<string>,
-                severity          string,
-                compiled_code     string
-            )
-            partition by date(executed_at)
-            cluster by status, test_name
-            options(
-                description = 'Journal d''exécution des tests dbt - alimenté par log_test_results()'
-            );
+        {% set insert_query %}
+          INSERT INTO {{ target.catalog }}.{{ target.schema }}.dbt_test_results
+          VALUES (
+            '{{ invocation_id }}',
+            TIMESTAMP('{{ run_started_at }}'),
+            '{{ test_name | replace("'", "''") }}',
+            '{{ test_type }}',
+            '{{ model_name }}',
+            '{{ column_name }}',
+            '{{ test_status }}',
+            {{ failures }},
+            '{{ severity }}',
+            '{{ target.name }}'
+          )
         {% endset %}
 
-        {% do run_query(create_sql) %}
-    {% endif %}
+        {% do run_query(insert_query) %}
 
-    {#- Filtrage : uniquement les tests (pas les runs/seeds/snapshots) -#}
-    {% set test_results = [] %}
-    {% for res in results %}
-        {% if res.node.resource_type == 'test' %}
-            {% do test_results.append(res) %}
-        {% endif %}
+      {% endif %}
+
     {% endfor %}
 
-    {% if test_results | length == 0 %}
-        {% do log("log_test_results: aucun test dans ce run, skip.", info=true) %}
-        {% do return('') %}
-    {% endif %}
+    {{ log("Logged " ~ (test_results | selectattr('node.name', 'defined') | list | length) ~ " test results", info=True) }}
 
-    {#- Construction de l'INSERT -#}
-    {% set insert_sql %}
-        insert into {{ fq_table }} (
-            invocation_id, run_started_at, executed_at,
-            project_name, target_name,
-            test_name, test_unique_id, resource_type,
-            status, failures, execution_time_s, message,
-            tags, severity, compiled_code
-        )
-        values
-        {% for res in test_results %}
-            (
-                {{ dbt_string_literal(invocation_id) }},
-                timestamp({{ dbt_string_literal(run_started_at) }}),
-                current_timestamp(),
-                {{ dbt_string_literal(project_name) }},
-                {{ dbt_string_literal(target.name) }},
-                {{ dbt_string_literal(res.node.name) }},
-                {{ dbt_string_literal(res.node.unique_id) }},
-                {{ dbt_string_literal(res.node.resource_type) }},
-                {{ dbt_string_literal(res.status) }},
-                {{ res.failures if res.failures is not none else 'null' }},
-                {{ res.execution_time if res.execution_time is not none else 'null' }},
-                {{ dbt_string_literal((res.message or '') | replace("'", "''") | truncate(2000, true, '')) }},
-                {{ _tags_to_bq_array(res.node.tags) }},
-                {{ dbt_string_literal(res.node.config.severity if res.node.config.severity is defined else 'error') }},
-                {{ dbt_string_literal((res.node.compiled_code or '') | replace("'", "''") | truncate(5000, true, '')) if res.node.compiled_code is defined else 'null' }}
-            ){% if not loop.last %},{% endif %}
-        {% endfor %}
-    {% endset %}
-
-    {% do run_query(insert_sql) %}
-
-    {#- Log console pour feedback -#}
-    {% set pass_count = 0 %}
-    {% set fail_count = 0 %}
-    {% set warn_count = 0 %}
-    {% set error_count = 0 %}
-    {% for r in test_results %}
-        {% if r.status == 'pass'  %}{% set pass_count  = pass_count  + 1 %}{% endif %}
-        {% if r.status == 'fail'  %}{% set fail_count  = fail_count  + 1 %}{% endif %}
-        {% if r.status == 'warn'  %}{% set warn_count  = warn_count  + 1 %}{% endif %}
-        {% if r.status == 'error' %}{% set error_count = error_count + 1 %}{% endif %}
-    {% endfor %}
-
-    {% do log(
-        "log_test_results: " ~ (test_results | length) ~ " test(s) loggés dans " ~ fq_table ~
-        " (pass=" ~ pass_count ~ ", fail=" ~ fail_count ~
-        ", warn=" ~ warn_count ~ ", error=" ~ error_count ~ ")",
-        info=true
-    ) %}
-
+  {% endif %}
 {% endmacro %}
 
-
-{#-
-    Convertit une liste de tags Python en littéral BigQuery ARRAY<STRING>.
-    Utilisé en interne par log_test_results.
--#}
-{% macro _tags_to_bq_array(tags) %}
-    {%- if tags is none or tags | length == 0 -%}
-        cast(null as array<string>)
-    {%- else -%}
-        [{% for t in tags %}{{ dbt_string_literal(t) }}{% if not loop.last %}, {% endif %}{% endfor %}]
-    {%- endif -%}
-{% endmacro %}
+    on-run-end:
+  - "{% if flags.WHICH == 'test' %}{{ log_test_results_to_monitoring(results) }}{% endif %}"
 
 
-# =============================================================================
-# Ajout à ton dbt_project.yml existant
-# =============================================================================
-
-on-run-end:
-  - "{{ log_test_results() }}"
-
-# Ou avec paramètres custom :
-# on-run-end:
-#   - "{{ log_test_results(target_schema='data_quality', target_table='dbt_test_log') }}"
-
-
-# -----------------------------------------------------------------------------
-# Optionnel : variables pour surcharger par environnement
-# -----------------------------------------------------------------------------
-vars:
-  # Désactive le logging en dev local si besoin
-  enable_test_logging: true
-
-
-# -----------------------------------------------------------------------------
-# Alternative : ne logger qu'en prod/CI
-# -----------------------------------------------------------------------------
-# on-run-end:
-#   - "{% if target.name in ['prod', 'ci'] %}{{ log_test_results() }}{% endif %}"
-
-
-
-
-          
-
-
-          
+    
