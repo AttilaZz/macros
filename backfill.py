@@ -2,8 +2,7 @@ from datetime import datetime, timedelta
 import json
 import os
 
-from airflow import DAG
-from airflow.decorators import task
+from airflow.sdk import DAG, task
 from airflow.providers.http.operators.http import HttpOperator
 
 from shared_tools.tools import default_args
@@ -17,7 +16,7 @@ timedeltas = {
 
 
 def _is_composer() -> bool:
-    # Variable d'env injectée automatiquement par Cloud Composer
+    """Variable d'env injectée automatiquement par Cloud Composer."""
     return "COMPOSER_ENVIRONMENT" in os.environ
 
 
@@ -41,7 +40,7 @@ def get_bearer_token() -> str:
 
     # Local
     import requests
-    from airflow.hooks.base import BaseHook
+    from airflow.sdk import BaseHook
 
     conn = BaseHook.get_connection("airflow_api")
     base = f"{conn.schema or 'http'}://{conn.host}:{conn.port or 8080}"
