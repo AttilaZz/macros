@@ -1,3 +1,20 @@
+TOKEN=$(curl -s -X POST http://localhost:8080/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{"username":"airflow","password":"airflow"}' | jq -r .access_token)
+
+curl -i -X POST http://localhost:8080/api/v2/backfills \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dag_id": "etl_paid_media",
+    "from_date": "2026-04-23T00:00:00Z",
+    "to_date": "2026-04-30T00:00:00Z",
+    "reprocess_behavior": "completed",
+    "max_active_runs": 1,
+    "run_backwards": false
+  }'
+
+
 from datetime import datetime, timedelta
 import os
 import requests
