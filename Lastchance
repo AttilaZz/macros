@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, unquote
 import os
 import requests
 
@@ -15,24 +16,15 @@ def _is_composer() -> bool:
 
 @task
 def trigger_backfill(days: int, **context):
-    # --- 1. Lecture de la Connection ---
-    conn = BaseHook.get_connection("airflow_api")
-    print(f"CONN: login={conn.login!r} pwd={conn.password!r} "
-          f"host={conn.host!r} port={conn.port!r} "
-          f"schema={conn.schema!r} type={conn.conn_type!r}")
-
-    scheme = conn.schema or ("https" if _is_composer() else "http")
-    base = f"{scheme}://{conn.host}"
-    if conn.port:
-        base += f":{conn.port}"
-    print(f"BASE: {base}")
-
-    # --- 2. Session sans héritage proxy ---
-    session = requests.Session()
-    session.trust_env = False
-
-    # --- 3. Récupération du token ---
+    # --- 1. Récupération du token + base URL ---
     if _is_composer():
+        # Composer : Connection classique (host uniquement) + token GCP via SA
+        conn = BaseHook.get_connection("airflow_api")
+        scheme = conn.schema or "https"
+        base = f"{scheme}://{conn.host}"
+        if conn.port:
+            base += f":{conn.port}"
+
         import google.auth
         from google.auth.transport.requests import Request
         creds, _ = google.auth.default(
@@ -40,26 +32,28 @@ def trigger_backfill(days: int, **context):
         )
         creds.refresh(Request())
         token = creds.token
-        print(f"TOKEN (Composer): len={len(token)} starts={token[:20]}...")
     else:
-        auth_req = requests.Request(
-            "POST",
-            f"{base}/auth/token",
-            json={"username": conn.login, "password": conn.password},
-        )
-        auth_prepared = session.prepare_request(auth_req)
-        print(f"AUTH REQ URL: {auth_prepared.url}")
-        print(f"AUTH REQ HEADERS: {dict(auth_prepared.headers)}")
-        print(f"AUTH REQ BODY: {auth_prepared.body!r}")
+        # Local : on parse l'URI brute pour échapper au secret masker d'Airflow
+        uri = os.environ["AIRFLOW_CONN_AIRFLOW_API"]
+        parsed = urlparse(uri)
+        login = unquote(parsed.username or "")
+        password = unquote(parsed.password or "")
+        host = parsed.hostname
+        port = parsed.port or 8080
+        base = f"http://{host}:{port}"
 
-        ar = session.send(auth_prepared, timeout=30)
-        print(f"AUTH RESP STATUS: {ar.status_code}")
-        print(f"AUTH RESP BODY: {ar.text!r}")
+        auth_session = requests.Session()
+        auth_session.trust_env = False
+        ar = auth_session.post(
+            f"{base}/auth/token",
+            json={"username": login, "password": password},
+            timeout=30,
+        )
+        print(f"AUTH STATUS: {ar.status_code} BODY: {ar.text}")
         ar.raise_for_status()
         token = ar.json()["access_token"]
-        print(f"TOKEN: len={len(token)} starts={token[:20]}...")
 
-    # --- 4. Construction du payload ---
+    # --- 2. Construction du payload ---
     ds = context["ds"]
     d = datetime.strptime(ds, "%Y-%m-%d")
     payload = {
@@ -72,24 +66,19 @@ def trigger_backfill(days: int, **context):
     }
     print(f"PAYLOAD: {payload}")
 
-    # --- 5. Création du backfill ---
-    bf_req = requests.Request(
-        "POST",
+    # --- 3. Création du backfill ---
+    session = requests.Session()
+    session.trust_env = False
+    br = session.post(
         f"{base}/api/v2/backfills",
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         },
         json=payload,
+        timeout=60,
     )
-    bf_prepared = session.prepare_request(bf_req)
-    print(f"BF REQ URL: {bf_prepared.url}")
-    print(f"BF REQ HEADERS: {dict(bf_prepared.headers)}")
-    print(f"BF REQ BODY: {bf_prepared.body!r}")
-
-    br = session.send(bf_prepared, timeout=60)
-    print(f"BF RESP STATUS: {br.status_code}")
-    print(f"BF RESP BODY: {br.text!r}")
+    print(f"BF STATUS: {br.status_code} BODY: {br.text}")
     br.raise_for_status()
     return br.json()
 
