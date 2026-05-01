@@ -15,17 +15,23 @@ def _is_composer() -> bool:
 
 @task
 def trigger_backfill(days: int, **context):
+    # --- 1. Lecture de la Connection ---
     conn = BaseHook.get_connection("airflow_api")
+    print(f"CONN: login={conn.login!r} pwd={conn.password!r} "
+          f"host={conn.host!r} port={conn.port!r} "
+          f"schema={conn.schema!r} type={conn.conn_type!r}")
+
     scheme = conn.schema or ("https" if _is_composer() else "http")
     base = f"{scheme}://{conn.host}"
     if conn.port:
         base += f":{conn.port}"
+    print(f"BASE: {base}")
 
-    # Session sans aucun héritage de proxy/env
+    # --- 2. Session sans héritage proxy ---
     session = requests.Session()
     session.trust_env = False
 
-    # 1) Token
+    # --- 3. Récupération du token ---
     if _is_composer():
         import google.auth
         from google.auth.transport.requests import Request
@@ -34,18 +40,26 @@ def trigger_backfill(days: int, **context):
         )
         creds.refresh(Request())
         token = creds.token
+        print(f"TOKEN (Composer): len={len(token)} starts={token[:20]}...")
     else:
-        tr = session.post(
+        auth_req = requests.Request(
+            "POST",
             f"{base}/auth/token",
             json={"username": conn.login, "password": conn.password},
-            timeout=30,
         )
-        print(f"/auth/token -> {tr.status_code}")
-        tr.raise_for_status()
-        token = tr.json()["access_token"]
-    print(f"Token len: {len(token)} | starts: {token[:20]}...")
+        auth_prepared = session.prepare_request(auth_req)
+        print(f"AUTH REQ URL: {auth_prepared.url}")
+        print(f"AUTH REQ HEADERS: {dict(auth_prepared.headers)}")
+        print(f"AUTH REQ BODY: {auth_prepared.body!r}")
 
-    # 2) Backfill
+        ar = session.send(auth_prepared, timeout=30)
+        print(f"AUTH RESP STATUS: {ar.status_code}")
+        print(f"AUTH RESP BODY: {ar.text!r}")
+        ar.raise_for_status()
+        token = ar.json()["access_token"]
+        print(f"TOKEN: len={len(token)} starts={token[:20]}...")
+
+    # --- 4. Construction du payload ---
     ds = context["ds"]
     d = datetime.strptime(ds, "%Y-%m-%d")
     payload = {
@@ -56,29 +70,34 @@ def trigger_backfill(days: int, **context):
         "max_active_runs": 1,
         "run_backwards": False,
     }
-    print(f"Payload: {payload}")
-    print(f"URL: {base}/api/v2/backfills")
+    print(f"PAYLOAD: {payload}")
 
-    r = session.post(
+    # --- 5. Création du backfill ---
+    bf_req = requests.Request(
+        "POST",
         f"{base}/api/v2/backfills",
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=60,
     )
-    print(f"Response {r.status_code}")
-    print(f"Request headers sent: {dict(r.request.headers)}")
-    print(f"Response body: {r.text}")
-    r.raise_for_status()
-    return r.json()
+    bf_prepared = session.prepare_request(bf_req)
+    print(f"BF REQ URL: {bf_prepared.url}")
+    print(f"BF REQ HEADERS: {dict(bf_prepared.headers)}")
+    print(f"BF REQ BODY: {bf_prepared.body!r}")
+
+    br = session.send(bf_prepared, timeout=60)
+    print(f"BF RESP STATUS: {br.status_code}")
+    print(f"BF RESP BODY: {br.text!r}")
+    br.raise_for_status()
+    return br.json()
 
 
 with DAG(
     "etl_paid_media_refresh",
     default_args=default_args,
-    description="Data Refresh on day minus 8 each day",
+    description="Data Refresh on day minus 8 each day -> Daily data not fully reliable on GCM",
     schedule=None,
     catchup=False,
 ) as dag:
