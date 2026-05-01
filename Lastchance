@@ -1,3 +1,7 @@
+print(f"DEBUG login_len={len(login)} pwd_len={len(password)}")
+print(f"DEBUG login_repr={login!r}")  # le login n'est pas masqué
+print(f"DEBUG uri_starts={uri[:30]!r}")
+
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote
 import os
