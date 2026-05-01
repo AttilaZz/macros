@@ -1,0 +1,26 @@
+from datetime import datetime, timedelta
+from airflow.sdk import DAG
+from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator
+
+from shared_tools.tools import default_args
+
+
+timedeltas = {"j_7": 7, "j_30": 30}
+
+
+with DAG(
+    "etl_paid_media_refresh",
+    default_args=default_args,
+    description="Data Refresh on day minus 8 each day -> Daily data not fully reliable on GCM",
+    schedule=None,
+    catchup=False,
+) as dag:
+
+    for delta_name, days in timedeltas.items():
+        TriggerDagRunOperator(
+            task_id=f"backfill_task_{delta_name}",
+            trigger_dag_id="etl_paid_media",
+            logical_date="{{ macros.ds_add(ds, -" + str(days) + ") }}T00:00:00+00:00",
+            reset_dag_run=True,   # si un run existe déjà à cette date, on le clear et rerun
+            wait_for_completion=False,
+        )
