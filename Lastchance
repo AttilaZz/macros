@@ -1,0 +1,86 @@
+from datetime import datetime, timedelta
+import os
+import requests
+
+from airflow.sdk import DAG, task, BaseHook
+from shared_tools.tools import default_args
+
+
+timedeltas = {"j_7": 7, "j_30": 30}
+
+
+def _is_composer() -> bool:
+    return "COMPOSER_ENVIRONMENT" in os.environ
+
+
+@task
+def trigger_backfill(days: int, **context):
+    conn = BaseHook.get_connection("airflow_api")
+    scheme = conn.schema or ("https" if _is_composer() else "http")
+    base = f"{scheme}://{conn.host}"
+    if conn.port:
+        base += f":{conn.port}"
+
+    # Session sans aucun héritage de proxy/env
+    session = requests.Session()
+    session.trust_env = False
+
+    # 1) Token
+    if _is_composer():
+        import google.auth
+        from google.auth.transport.requests import Request
+        creds, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        creds.refresh(Request())
+        token = creds.token
+    else:
+        tr = session.post(
+            f"{base}/auth/token",
+            json={"username": conn.login, "password": conn.password},
+            timeout=30,
+        )
+        print(f"/auth/token -> {tr.status_code}")
+        tr.raise_for_status()
+        token = tr.json()["access_token"]
+    print(f"Token len: {len(token)} | starts: {token[:20]}...")
+
+    # 2) Backfill
+    ds = context["ds"]
+    d = datetime.strptime(ds, "%Y-%m-%d")
+    payload = {
+        "dag_id": "etl_paid_media",
+        "from_date": (d - timedelta(days=days + 1)).strftime("%Y-%m-%dT00:00:00Z"),
+        "to_date":   (d - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00Z"),
+        "reprocess_behavior": "completed",
+        "max_active_runs": 1,
+        "run_backwards": False,
+    }
+    print(f"Payload: {payload}")
+    print(f"URL: {base}/api/v2/backfills")
+
+    r = session.post(
+        f"{base}/api/v2/backfills",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=60,
+    )
+    print(f"Response {r.status_code}")
+    print(f"Request headers sent: {dict(r.request.headers)}")
+    print(f"Response body: {r.text}")
+    r.raise_for_status()
+    return r.json()
+
+
+with DAG(
+    "etl_paid_media_refresh",
+    default_args=default_args,
+    description="Data Refresh on day minus 8 each day",
+    schedule=None,
+    catchup=False,
+) as dag:
+    for delta_name, days in timedeltas.items():
+        trigger_backfill.override(task_id=f"backfill_task_{delta_name}")(days=days)
